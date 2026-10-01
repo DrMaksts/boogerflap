@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Booger Flap</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    background: #1a1a2e;
+    overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  body {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+
+  canvas {
+    background: #4a0f1c;
+    width: min(100vw, 66.667vh);
+    width: min(100vw, 66.667dvh);
+    aspect-ratio: 2 / 3;
+    height: auto;
+    -webkit-tap-highlight-color: transparent;
+    box-shadow: 0 0 30px rgba(0, 0, 0, 0.5);
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="400" height="600"></canvas>
+
+<script>
+// ---------- Setup ----------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = 400, H = 600;   // game units; the canvas is scaled for sharp screens
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+canvas.width = W * DPR;
+canvas.height = H * DPR;
+ctx.scale(DPR, DPR);
+
+// ---------- Game settings (easy to tweak!) ----------
+const GRAVITY = 0.45;
+const FLAP_POWER = -7.5;
+const PIPE_WIDTH = 60;
+const PIPE_GAP = 150;
+const PIPE_SPEED = 2.5;          // starting speed
+
+// Difficulty: every 10 points the game gets 2% faster (capped so it stays playable)
+const SPEED_STEP_POINTS = 10;
+const SPEED_STEP_PERCENT = 0.02;
+const MAX_SPEED_MULTIPLIER = 1.5;
+const PIPE_SPAWN_FRAMES = 95;   // frames between new pipes
+const GROUND_HEIGHT = 70;
+
+// ---------- Game state ----------
+let bird, pipes, slime, score, bestScore, frameCount, state, groundOffset;
+// state is one of: "ready", "playing", "gameover"
+
+let scrollX = 0, shake = 0, deathTime = 0, newBest = false, prevState = "ready";
+
+// ---------- High score (saved in the browser with localStorage) ----------
+const HIGH_SCORE_KEY = "flappyHighScore";
+
+function loadHighScore() {
+  try {
+    return parseInt(localStorage.getItem(HIGH_SCORE_KEY), 10) || 0;
+  } catch (err) {
+    return 0; // storage unavailable (e.g. private mode)
+  }
+}
+
+function saveHighScore() {
+  try {
+    localStorage.setItem(HIGH_SCORE_KEY, String(bestScore));
+  } catch (err) {
+    // ignore: the game still works, the score just won't persist
+  }
+}
+
+bestScore = loadHighScore();
+
+function resetGame() {
+  bird = {
+    x: 90,
+    y: H / 2 - 40,
+    radius: 14,
+    velocity: 0,
+    rotation: 0,
+    squash: 0,
+    squashVel: 0
+  };
+  pipes = [];
+  slime = [];
+  newBest = false;
+  score = 0;
+  frameCount = 0;
+  groundOffset = 0;
+  state = "ready";
+}
+
+// ---------- Sound (Web Audio API, no audio files) ----------
+let audioCtx = null;
+let noiseBuffer = null;
+let master = null;
+let muted = false;
+
+// Browsers only allow audio after a user action, so we create it on the first tap/key
+function initAudio() {
+  try {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        audioCtx = new AC();
+        master = audioCtx.createGain();
+        master.gain.value = muted ? 0 : 1;
+        master.connect(audioCtx.destination);
+        noiseBuffer = makeNoise();
+      }
+    }
+    if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+  } catch (err) {
+    audioCtx = null;
+  }
+}
+
+// One second of random noise, used for the wet "squish" textures
+function makeNoise() {
+  const length = audioCtx.sampleRate;
+  const buffer = audioCtx.createBuffer(1, length, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < length; i++) data[i] = Math.random() * 2 - 1;
+  return buffer;
+}
+
+// A gurgly, wobbling tone: a buzzy wave whose pitch is wobbled by a fast LFO
+function wet(startFreq, endFreq, duration, lfoRate, lfoDepth, volume, delay = 0) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime + delay;
+  const osc = audioCtx.createOscillator();
+  const lfo = audioCtx.createOscillator();
+  const lfoGain = audioCtx.createGain();
+  const filter = audioCtx.createBiquadFilter();
+  const gain = audioCtx.createGain();
+
+  osc.type = "sawtooth";
+  osc.frequency.setValueAtTime(startFreq, t);
+  osc.frequency.exponentialRampToValueAtTime(endFreq, t + duration);
+
+  lfo.frequency.value = lfoRate;
+  lfoGain.gain.value = lfoDepth;
+  lfo.connect(lfoGain);
+  lfoGain.connect(osc.frequency);
+
+  filter.type = "lowpass";
+  filter.Q.value = 6;
+  filter.frequency.setValueAtTime(900, t);
+  filter.frequency.exponentialRampToValueAtTime(200, t + duration);
+
+  gain.gain.setValueAtTime(volume, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+
+  osc.connect(filter);
+  filter.connect(gain);
+  gain.connect(master);
+  osc.start(t);
+  lfo.start(t);
+  osc.stop(t + duration);
+  lfo.stop(t + duration);
+}
+
+// A wet squelchy hiss: filtered noise whose filter sweeps up or down
+function squish(startFreq, endFreq, duration, volume, delay = 0) {
+  if (!audioCtx || !noiseBuffer) return;
+  const t = audioCtx.currentTime + delay;
+  const src = audioCtx.createBufferSource();
+  const filter = audioCtx.createBiquadFilter();
+  const gain = audioCtx.createGain();
+
+  src.buffer = noiseBuffer;
+  filter.type = "bandpass";
+  filter.Q.value = 10;
+  filter.frequency.setValueAtTime(startFreq, t);
+  filter.frequency.exponentialRampToValueAtTime(endFreq, t + duration);
+
+  gain.gain.setValueAtTime(volume, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+
+  src.connect(filter);
+  filter.connect(gain);
+  gain.connect(master);
+  src.start(t, Math.random() * 0.5);
+  src.stop(t + duration);
+}
+
+// A little "bloop" bubble popping
+function bubble(startFreq, endFreq, duration, volume, delay = 0) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime + delay;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+
+  osc.type = "sine";
+  osc.frequency.setValueAtTime(startFreq, t);
+  osc.frequency.exponentialRampToValueAtTime(endFreq, t + duration);
+
+  gain.gain.setValueAtTime(0.001, t);
+  gain.gain.linearRampToValueAtTime(volume, t + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+
+  osc.connect(gain);
+  gain.connect(master);
+  osc.start(t);
+  osc.stop(t + duration);
+}
+
+function playFlap() {
+  wet(150, 420, 0.15, 38, 45, 0.2);   // gloopy squelch
+  squish(1100, 350, 0.12, 0.18);      // wet stretch
+}
+
+function playScore() {
+  bubble(350, 1000, 0.09, 0.25);          // bloop
+  bubble(500, 1500, 0.1, 0.22, 0.09);     // bloop-bloop
+  squish(2000, 800, 0.06, 0.06);
+}
+
+function playGameOver() {
+  wet(260, 40, 0.8, 22, 70, 0.22);        // long gurgling splat
+  squish(1200, 150, 0.6, 0.25);           // wet smack
+  bubble(180, 60, 0.12, 0.2, 0.2);        // gross leftover bubbles
+  bubble(240, 80, 0.1, 0.18, 0.38);
+  bubble(150, 50, 0.14, 0.18, 0.55);
+}
+
+// ---------- Input ----------
+function flap() {
+  initAudio();
+  if (state === "ready") {
+    state = "playing";
+    bird.velocity = FLAP_POWER;
+    playFlap();
+    slimyJump();
+  } else if (state === "playing") {
+    bird.velocity = FLAP_POWER;
+    playFlap();
+    slimyJump();
+  } else if (state === "menu") {
+    startGame();
+  } else if (state === "gameover" && Date.now() - deathTime > 400) {
+    startGame();
+  }
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.repeat) return;
+  if (e.code === "Space") { e.preventDefault(); flap(); }
+  else if (e.code === "KeyP" || e.code === "Escape") togglePause();
+  else if (e.code === "KeyM") toggleMute();
+});
+
+// Pointer events cover mouse clicks and touch taps. Buttons first, otherwise flap.
+canvas.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  initAudio();
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) * W / r.width;
+  const y = (e.clientY - r.top) * H / r.height;
+  for (const b of buttons) {
+    if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { b.action(); return; }
+  }
+  flap();
+});
+
+// Pause automatically if the player switches tabs or apps
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && state === "playing") togglePause();
+});
+
+// ---------- Difficulty ----------
+function currentPipeSpeed() {
+  const steps = Math.floor(score / SPEED_STEP_POINTS);
+  const multiplier = Math.pow(1 + SPEED_STEP_PERCENT, steps);
+  return PIPE_SPEED * Math.min(multiplier, MAX_SPEED_MULTIPLIER);
+}
+
+// ---------- Slime (squishy bird + flying drops) ----------
+// bird.squash > 0 makes the booger wide and flat, < 0 makes it tall and thin.
+// A spring pulls it back to 0, so it wobbles like jelly.
+function updateSquash() {
+  bird.squashVel += -0.22 * bird.squash;
+  bird.squashVel *= 0.82;
+  bird.squash += bird.squashVel;
+}
+
+function spawnSlime(x, y, count, speed, color) {
+  for (let i = 0; i < count; i++) {
+    slime.push({
+      x: x,
+      y: y,
+      vx: (Math.random() - 0.7) * speed * 1.5,
+      vy: (Math.random() - 0.3) * speed,
+      r: 2 + Math.random() * 3,
+      life: 40 + Math.random() * 25,
+      onGround: false,
+      color: color
+    });
+  }
+  if (slime.length > 70) slime.splice(0, slime.length - 70);
+}
+
+function updateSlime() {
+  for (const p of slime) {
+    if (!p.onGround) {
+      p.vy += 0.25;
+      p.x += p.vx;
+      p.y += p.vy;
+      if (p.y >= H - GROUND_HEIGHT) {
+        p.y = H - GROUND_HEIGHT;
+        p.onGround = true;   // splat! it sticks to the ground
+        if (p.color) p.life = 0;
+      }
+    } else if (state === "playing") {
+      p.x -= currentPipeSpeed();     // stuck drops scroll with the ground
+    }
+    p.life--;
+  }
+  slime = slime.filter((p) => p.life > 0 && p.x > -10);
+}
+
+function slimyJump() {
+  bird.squash = 0.45;                          // squash flat, then spring back tall
+  spawnSlime(bird.x - 8, bird.y + 6, 4, 1.5);  // fling a few drops
+}
+
+function drawSlime() {
+  ctx.strokeStyle = "#4f7a1a";
+  ctx.lineWidth = 1.5;
+  for (const p of slime) {
+    const r = p.r * Math.min(1, p.life / 20);
+    ctx.fillStyle = p.color || "#9acd32";
+    ctx.beginPath();
+    if (p.onGround) {
+      ctx.ellipse(p.x, p.y, r * 1.6, r * 0.6, 0, 0, Math.PI * 2);   // flat puddle
+    } else {
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    }
+    ctx.fill();
+    ctx.stroke();
+  }
+}
+
+// ---------- Pipes ----------
+function spawnPipe() {
+  const minTop = 70;
+  const maxTop = H - GROUND_HEIGHT - PIPE_GAP - 70;
+  const topHeight = minTop + Math.random() * (maxTop - minTop);
+
+  pipes.push({
+    x: W,
+    topHeight: topHeight,
+    topLook: randomLook(),
+    bottomLook: randomLook(),
+    passed: false
+  });
+}
+
+// ---------- Update ----------
+function update() {
+  if (state === "paused") return;
+  updateSquash();
+  updateSlime();
+
+  if (state === "ready" || state === "menu") {
+    // Gentle bobbing before the game starts
+    bird.y = H / 2 - 40 + Math.sin(Date.now() / 250) * 8;
+    groundOffset = (groundOffset + currentPipeSpeed()) % 24;
+  scrollX += currentPipeSpeed();
+    return;
+  }
+
+  if (state === "gameover") {
+    // Let the bird fall to the ground after dying
+    if (bird.y + bird.radius < H - GROUND_HEIGHT) {
+      bird.velocity += GRAVITY;
+      bird.y += bird.velocity;
+      bird.rotation = Math.min(Math.PI / 2, bird.rotation + 0.1);
+    }
+    return;
+  }
+
+  // --- Bird physics ---
+  bird.velocity += GRAVITY;
+  bird.y += bird.velocity;
+
+  // Tilt the bird based on speed
+  bird.rotation = Math.max(-0.5, Math.min(1.2, bird.velocity * 0.07));
+
+  // --- Pipes ---
+  frameCount++;
+  if (frameCount % 12 === 0) spawnSlime(bird.x - 10, bird.y + 8, 1, 0.3);  // little drips
+  if (frameCount % PIPE_SPAWN_FRAMES === 1) {
+    spawnPipe();
+  }
+
+  for (const pipe of pipes) {
+    pipe.x -= currentPipeSpeed();
+
+    // Score when the bird passes the pipe
+    if (!pipe.passed && pipe.x + PIPE_WIDTH < bird.x - bird.radius) {
+      pipe.passed = true;
+      score++;
+      playScore();
+      spawnSlime(bird.x + 20, bird.y, 8, 3, "#ffe066");   // gold sparkles
+      if (score > bestScore) {
+        bestScore = score;
+        newBest = true;
+        saveHighScore();
+      }
+    }
+  }
+
+  // Remove pipes that left the screen
+  pipes = pipes.filter((p) => p.x + PIPE_WIDTH > 0);
+
+  // Moving ground
+  groundOffset = (groundOffset + currentPipeSpeed()) % 24;
+  scrollX += currentPipeSpeed();
+
+  // --- Collisions ---
+  checkCollisions();
+}
+
+function checkCollisions() {
+  // Ground and ceiling
+  if (bird.y + bird.radius >= H - GROUND_HEIGHT) {
+    bird.y = H - GROUND_HEIGHT - bird.radius;
+    die();
+    return;
+  }
+  if (bird.y - bird.radius <= 0) {
+    bird.y = bird.radius;
+    die();
+    return;
+  }
+
+  // Pipes (circle vs rectangle test)
+  for (const pipe of pipes) {
+    const bottomY = pipe.topHeight + PIPE_GAP;
+
+    if (circleHitsRect(bird.x, bird.y, bird.radius, pipe.x, 0, PIPE_WIDTH, pipe.topHeight) ||
+        circleHitsRect(bird.x, bird.y, bird.radius, pipe.x, bottomY, PIPE_WIDTH, H - GROUND_HEIGHT - bottomY)) {
+      die();
+      return;
+    }
+  }
+}
+
+function circleHitsRect(cx, cy, r, rx, ry, rw, rh) {
+  // Find the closest point on the rectangle to the circle's center
+  const closestX = Math.max(rx, Math.min(cx, rx + rw));
+  const closestY = Math.max(ry, Math.min(cy, ry + rh));
+  const dx = cx - closestX;
+  const dy = cy - closestY;
+  return dx * dx + dy * dy < r * r;
+}
+
+function die() {
+  if (state === "gameover") return;
+  state = "gameover";
+  playGameOver();
+  bird.squash = 0.7;                       // splat!
+  spawnSlime(bird.x, bird.y, 16, 4);
+  deathTime = Date.now();
+  shake = 12;
+}
+
+// ---------- Drawing ----------
+function drawVein(x1, y1, cx, cy, x2, y2) {
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.quadraticCurveTo(cx, cy, x2, y2);
+  ctx.stroke();
+}
+
+function rnd(i) { const x = Math.sin(i * 127.1) * 43758.5; return x - Math.floor(x); }
+function wrapX(i, count, factor) {
+  const span = W + 160;
+  return (((i * span / count - scrollX * factor) % span) + span) % span - 80;
+}
+
+function drawBackground() {
+  // Grimy nostril wall: dark in the middle, dirty pink toward the edges
+  const wall = ctx.createRadialGradient(W / 2, H / 2, 40, W / 2, H / 2, H * 0.75);
+  wall.addColorStop(0, "#3a0c14");
+  wall.addColorStop(0.55, "#8a3a44");
+  wall.addColorStop(1, "#c98a80");
+  ctx.fillStyle = wall;
+  ctx.fillRect(0, 0, W, H);
+
+  // Bloody veins on the walls
+  ctx.strokeStyle = "rgba(170, 20, 35, 0.55)";
+  ctx.lineWidth = 2;
+  drawVein(0, 150, 60, 190, 110, 140);
+  drawVein(W, 260, W - 70, 230, W - 120, 280);
+  drawVein(0, 420, 50, 400, 90, 450);
+
+  // Parallax layers. Far: dark cavities + brown grime
+  ctx.fillStyle = "rgba(0, 0, 0, 0.18)";
+  for (let i = 0; i < 4; i++) {
+    ctx.beginPath();
+    ctx.arc(wrapX(i, 4, 0.12), 120 + rnd(i) * 300, 50 + rnd(i + 9) * 40, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.fillStyle = "rgba(90, 60, 20, 0.22)";
+  for (let i = 0; i < 5; i++) {
+    ctx.beginPath();
+    ctx.ellipse(wrapX(i, 5, 0.22), 80 + rnd(i + 40) * 380, 30 + rnd(i + 41) * 25, 14 + rnd(i + 42) * 10, rnd(i) * 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Middle: mucus bubbles and dried blood crusts
+  for (let i = 0; i < 8; i++) {
+    const bx = wrapX(i, 8, 0.35), by = 60 + rnd(i + 3) * 400, br = 6 + rnd(i + 5) * 10;
+    ctx.fillStyle = "rgba(255, 255, 255, 0.10)";
+    ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "rgba(255, 255, 255, 0.25)";
+    ctx.beginPath(); ctx.arc(bx - br * 0.3, by - br * 0.3, br * 0.25, 0, Math.PI * 2); ctx.fill();
+  }
+  for (let i = 0; i < 5; i++) {
+    const cx = wrapX(i, 5, 0.5), cy = 90 + rnd(i + 60) * 360;
+    ctx.fillStyle = "rgba(100, 14, 20, 0.6)";
+    ctx.beginPath(); ctx.ellipse(cx, cy, 14, 8, rnd(i + 61) * 3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx + 12, cy - 5, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx - 9, cy + 6, 4, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // Near: nose hairs and dripping blood hanging from the top
+  ctx.strokeStyle = "#2a1a14";
+  ctx.lineWidth = 3;
+  ctx.lineCap = "round";
+  for (let i = 0; i < 6; i++) {
+    const hx = wrapX(i, 6, 0.65), len = 50 + rnd(i + 20) * 60;
+    drawVein(hx, 0, hx + 22, len * 0.5, hx + (rnd(i + 30) - 0.5) * 40, len);
+  }
+  ctx.strokeStyle = "#8b0f1a";
+  ctx.fillStyle = "#8b0f1a";
+  ctx.lineWidth = 4;
+  for (let i = 0; i < 3; i++) {
+    const dx = wrapX(i + 0.5, 3, 0.65), dl = 30 + rnd(i + 70) * 60;
+    ctx.beginPath(); ctx.moveTo(dx, 0); ctx.lineTo(dx, dl); ctx.stroke();
+    ctx.beginPath(); ctx.arc(dx, dl, 5, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.lineCap = "butt";
+}
+
+// Each finger gets its own random look: some are bloody, some have a booger stuck on
+function randomLook() {
+  return {
+    blood: Math.random() < 0.4 ? 1 + Math.floor(Math.random() * 3) : 0,   // 0 = clean
+    booger: Math.random() < 0.35,
+    seed: Math.random() * 1000
+  };
+}
+
+function drawFingerBlood(x, y1, y2, tipDown, look) {
+  const tipY = tipDown ? y2 : y1;
+  const dir = tipDown ? -1 : 1;   // direction from the tip back into the finger
+  ctx.fillStyle = ctx.strokeStyle = "rgba(150, 15, 25, 0.85)";
+
+  // Smear on the tip
+  ctx.beginPath();
+  ctx.ellipse(x + PIPE_WIDTH / 2 + 6, tipY + dir * 2, 16, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Streaks running down the finger (more blood = more and longer streaks)
+  ctx.lineCap = "round";
+  for (let k = 0; k < look.blood; k++) {
+    const sx = x + 10 + rnd(look.seed + k) * (PIPE_WIDTH - 20);
+    const len = 25 + rnd(look.seed + k + 10) * 25 * look.blood;
+    ctx.lineWidth = 3 + rnd(look.seed + k + 20) * 2;
+    ctx.beginPath();
+    ctx.moveTo(sx, tipY + dir * 6);
+    ctx.lineTo(sx, tipY + dir * (6 + len));
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(sx, tipY + dir * (6 + len), ctx.lineWidth * 0.8, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.lineCap = "butt";
+
+  // Splatter dots on the finger when it's really bloody
+  if (look.blood >= 2) {
+    for (let k = 0; k < 3; k++) {
+      ctx.beginPath();
+      ctx.arc(x + 6 + rnd(look.seed + k + 30) * (PIPE_WIDTH - 12), tipY + dir * (40 + rnd(look.seed + k + 40) * 60), 2 + rnd(look.seed + k) * 1.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+function drawFingerBooger(x, y1, y2, tipDown, look) {
+  // [fill, outline] colors: fresh green, yellowy, dark green, snotty brown, pale olive
+  const palettes = [["#9acd32", "#4f7a1a"], ["#c8d84a", "#7a8a1a"], ["#6fa83a", "#35591a"], ["#b5a23a", "#6b5a1a"], ["#a8c060", "#5a6a2a"]];
+  const count = 1 + (rnd(look.seed + 49) > 0.6 ? 1 : 0) + (rnd(look.seed + 48) > 0.85 ? 1 : 0);
+
+  for (let j = 0; j < count; j++) {
+    const s = look.seed + j * 100;                       // every booger has its own random numbers
+    const pal = palettes[Math.floor(rnd(s + 1) * palettes.length)];
+    const d = 30 + rnd(s + 2) * Math.max(0, y2 - y1 - 60);
+    const by = tipDown ? y2 - d : y1 + d;
+    const bx = x + 3 + rnd(s + 3) * (PIPE_WIDTH - 6);
+    const r = 4 + rnd(s + 4) * 8;                        // size: tiny to chunky
+
+    // Random lumpy shape: 2-5 stretched ellipses glued together
+    const blobs = [];
+    const n = 2 + Math.floor(rnd(s + 5) * 4);
+    for (let i = 0; i < n; i++) {
+      const ang = rnd(s + 10 + i) * Math.PI * 2, dist = rnd(s + 20 + i) * r * 0.9;
+      blobs.push([Math.cos(ang) * dist, Math.sin(ang) * dist, r * (0.45 + rnd(s + 30 + i) * 0.5), r * (0.3 + rnd(s + 40 + i) * 0.6), rnd(s + 50 + i) * Math.PI]);
+    }
+    ctx.fillStyle = pal[1];
+    blobs.forEach(([ox, oy, rx, ry, rot]) => { ctx.beginPath(); ctx.ellipse(bx + ox, by + oy, rx + 1.5, ry + 1.5, rot, 0, Math.PI * 2); ctx.fill(); });
+    ctx.fillStyle = pal[0];
+    blobs.forEach(([ox, oy, rx, ry, rot]) => { ctx.beginPath(); ctx.ellipse(bx + ox, by + oy, rx, ry, rot, 0, Math.PI * 2); ctx.fill(); });
+
+    // Sometimes shiny
+    if (rnd(s + 6) > 0.3) {
+      ctx.fillStyle = "rgba(255, 255, 255, 0.5)";
+      ctx.beginPath(); ctx.ellipse(bx - r * 0.3, by - r * 0.4, r * 0.35, r * 0.2, -0.5, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // Sometimes a stringy bit of snot dangles down, with a random length and thickness
+    if (rnd(s + 7) > 0.5) {
+      const len = 5 + rnd(s + 8) * 18, sx = bx + (rnd(s + 9) - 0.5) * r;
+      ctx.strokeStyle = ctx.fillStyle = pal[0];
+      ctx.lineWidth = 1.5 + rnd(s + 11) * 1.5;
+      ctx.beginPath(); ctx.moveTo(sx, by + r * 0.5); ctx.lineTo(sx, by + r * 0.5 + len); ctx.stroke();
+      ctx.beginPath(); ctx.arc(sx, by + r * 0.5 + len + 1, ctx.lineWidth * 1.1, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+
+function drawFinger(x, y1, y2, tipDown, look) {
+  // The finger fills y1..y2. The fingertip is at y2 if tipDown, otherwise at y1.
+  const r = 16;
+
+  const grad = ctx.createLinearGradient(x, 0, x + PIPE_WIDTH, 0);
+  grad.addColorStop(0, "#d89a60");
+  grad.addColorStop(0.5, "#f6d0a0");
+  grad.addColorStop(1, "#c98a52");
+  ctx.fillStyle = grad;
+  ctx.strokeStyle = "#8a5430";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.roundRect(x, y1, PIPE_WIDTH, y2 - y1, tipDown ? [0, 0, r, r] : [r, r, 0, 0]);
+  ctx.fill();
+  ctx.stroke();
+
+  // Knuckle wrinkles
+  ctx.strokeStyle = "rgba(138, 84, 48, 0.7)";
+  ctx.lineWidth = 2;
+  for (let k = 1; k < 20; k++) {
+    const wy = tipDown ? y2 - 70 * k : y1 + 70 * k;
+    if (wy < y1 + 10 || wy > y2 - 10) break;
+    for (let i = 0; i < 2; i++) {
+      const yy = wy + i * 6;
+      ctx.beginPath();
+      ctx.moveTo(x + 10, yy);
+      ctx.quadraticCurveTo(x + PIPE_WIDTH / 2, yy + 4, x + PIPE_WIDTH - 10, yy);
+      ctx.stroke();
+    }
+  }
+
+  // Fingernail
+  const ny = tipDown ? y2 - 36 : y1 + 8;
+  ctx.fillStyle = "#f8dde0";
+  ctx.strokeStyle = "#b9787f";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(x + 10, ny, PIPE_WIDTH - 20, 28, tipDown ? [4, 4, 10, 10] : [10, 10, 4, 4]);
+  ctx.fill();
+  ctx.stroke();
+
+  // Dirt under the nail, then blood and a booger on some fingers
+  ctx.fillStyle = "#4a3320";
+  ctx.fillRect(x + 12, tipDown ? ny + 22 : ny + 1, PIPE_WIDTH - 24, 5);
+  if (look.blood) drawFingerBlood(x, y1, y2, tipDown, look);
+  if (look.booger) drawFingerBooger(x, y1, y2, tipDown, look);
+
+  // Nail shine
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.8)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x + 17, ny + 7);
+  ctx.lineTo(x + 17, ny + 17);
+  ctx.stroke();
+}
+
+function drawPipe(pipe) {
+  const bottomY = pipe.topHeight + PIPE_GAP;
+  drawFinger(pipe.x, -10, pipe.topHeight, true, pipe.topLook);                        // finger pointing down
+  drawFinger(pipe.x, bottomY, H - GROUND_HEIGHT + 5, false, pipe.bottomLook);            // finger pointing up
+}
+
+function drawGround() {
+  const y = H - GROUND_HEIGHT;
+
+  // Skin
+  ctx.fillStyle = "#e0a08a";
+  ctx.fillRect(0, y, W, GROUND_HEIGHT);
+  ctx.fillStyle = "#c97d6b";
+  ctx.fillRect(0, y, W, 10);
+
+  // Scrolling stubble
+  ctx.fillStyle = "#6b4a3f";
+  for (let row = 0; row < 3; row++) {
+    for (let x = -24; x < W + 24; x += 24) {
+      const dotX = x - groundOffset + row * 9;
+      ctx.beginPath();
+      ctx.arc(dotX, y + 24 + row * 16, 1.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Dried blood and dirt spots
+  for (let i = 0; i < 4; i++) {
+    ctx.fillStyle = i % 2 ? "#7a1019" : "#5a3d2e";
+    ctx.beginPath();
+    ctx.ellipse(wrapX(i, 4, 1), y + 28 + rnd(i + 80) * 28, 9, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Dark top border
+  ctx.fillStyle = "#8a4a3c";
+  ctx.fillRect(0, y, W, 3);
+}
+
+function drawBird() {
+  ctx.save();
+  ctx.translate(bird.x, bird.y);
+  ctx.rotate(bird.rotation);
+
+  // Squash and stretch: wide + flat after a flap, tall + thin when falling fast
+  const stretch = Math.max(-0.1, Math.min(0.2, bird.velocity * 0.02));
+  ctx.scale(1 + bird.squash - stretch, 1 - bird.squash + stretch);
+
+  // The booger is a few lumpy blobs stuck together: [x, y, radius].
+  // Each blob jiggles a little, and the tail blob drips behind it.
+  const t = Date.now() / 120;
+  const drip = Math.max(-3, Math.min(6, bird.velocity * 0.8));
+  const base = [[0, 0, 13], [-8, 5, 8], [-12, -3, 6], [6, 8, 7], [-14, 6 + drip, 4.5]];
+  const blobs = base.map(([bx, by, br], i) => [
+    bx + Math.sin(t + i * 1.7) * 1.2,
+    by + Math.cos(t * 1.1 + i * 2.3) * 1.2,
+    br
+  ]);
+
+  // Dark outline first, then green fill on top so the blobs merge
+  ctx.fillStyle = "#4f7a1a";
+  blobs.forEach(([bx, by, br]) => {
+    ctx.beginPath();
+    ctx.arc(bx, by, br + 2, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.fillStyle = "#9acd32";
+  blobs.forEach(([bx, by, br]) => {
+    ctx.beginPath();
+    ctx.arc(bx, by, br, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  // Glossy shine
+  ctx.fillStyle = "rgba(255, 255, 255, 0.5)";
+  ctx.beginPath();
+  ctx.ellipse(-3, -7, 4, 2.5, -0.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Googly eyes
+  ctx.fillStyle = "#fff";
+  ctx.strokeStyle = "#2b2b2b";
+  ctx.lineWidth = 1.5;
+  [[2, -3], [9, -3]].forEach(([ex, ey]) => {
+    ctx.beginPath();
+    ctx.arc(ex, ey, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  });
+  ctx.fillStyle = "#000";
+  const look = Math.max(-1.5, Math.min(1.5, bird.velocity * 0.25));
+  [[3.5, -3 + look], [10.5, -3 + look]].forEach(([px, py]) => {
+    ctx.beginPath();
+    ctx.arc(px, py, 1.8, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  // Smile
+  ctx.beginPath();
+  ctx.arc(6, 4, 3, 0.1, Math.PI - 0.1);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawText(text, x, y, size, color = "#fff") {
+  ctx.font = `bold ${size}px Arial, sans-serif`;
+  ctx.textAlign = "center";
+  ctx.lineWidth = size / 6;
+  ctx.strokeStyle = "#2b2b2b";
+  ctx.lineJoin = "round";
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = color;
+  ctx.fillText(text, x, y);
+}
+
+// ---------- UI ----------
+const buttons = [];
+
+function startGame() { resetGame(); state = "ready"; }
+function goMenu() { resetGame(); state = "menu"; }
+function togglePause() {
+  if (state === "playing" || state === "ready") { prevState = state; state = "paused"; }
+  else if (state === "paused") state = prevState;
+}
+function toggleMute() {
+  muted = !muted;
+  if (master) master.gain.value = muted ? 0 : 1;
+}
+
+function drawButton(label, x, y, w, h, action, color) {
+  buttons.push({ x, y, w, h, action });
+  ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+  ctx.beginPath(); ctx.roundRect(x, y + 4, w, h, 12); ctx.fill();
+  ctx.fillStyle = color || "#8ed14a";
+  ctx.strokeStyle = "#2b2b2b";
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, 12); ctx.fill(); ctx.stroke();
+  drawText(label, x + w / 2, y + h / 2 + 7, 20);
+}
+
+function drawIconButton(cx, cy, action, icon) {
+  buttons.push({ x: cx - 22, y: cy - 22, w: 44, h: 44, action });
+  ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+  ctx.beginPath(); ctx.arc(cx, cy, 18, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 3;
+  icon(cx, cy);
+}
+
+const pauseIcon = (x, y) => { ctx.fillRect(x - 6, y - 7, 4, 14); ctx.fillRect(x + 2, y - 7, 4, 14); };
+const playIcon = (x, y) => {
+  ctx.beginPath(); ctx.moveTo(x - 5, y - 8); ctx.lineTo(x + 8, y); ctx.lineTo(x - 5, y + 8); ctx.fill();
+};
+const soundIcon = (x, y) => {
+  ctx.font = "bold 22px Arial, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("\u266A", x, y + 7);
+  if (muted) { ctx.beginPath(); ctx.moveTo(x - 9, y + 9); ctx.lineTo(x + 9, y - 9); ctx.stroke(); }
+};
+
+function drawUI() {
+  buttons.length = 0;
+  drawIconButton(30, 32, toggleMute, soundIcon);
+
+  if (state === "menu") {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.25)";
+    ctx.fillRect(0, 0, W, H);
+    drawText("BOOGER", W / 2, 140, 56, "#9acd32");
+    drawText("FLAP", W / 2, 195, 56, "#9acd32");
+    drawText("High Score: " + bestScore, W / 2, 340, 20);
+    drawButton("PLAY", W / 2 - 80, 385, 160, 52, startGame);
+    drawText("Tap / Space to flap", W / 2, 480, 16);
+    drawText("P = pause    M = mute", W / 2, 505, 16);
+    return;
+  }
+
+  drawIconButton(W - 30, 32, togglePause, state === "paused" ? playIcon : pauseIcon);
+
+  if (state !== "gameover") {
+    drawText(score, W / 2, 80, 56);
+    drawText("High Score: " + bestScore, W / 2, 108, 16);
+  }
+  if (state === "playing") drawText("Speed x" + (currentPipeSpeed() / PIPE_SPEED).toFixed(2), W / 2, 130, 14);
+  if (state === "ready") {
+    drawText("Get Ready!", W / 2, 190, 38);
+    drawText("Tap to flap", W / 2, 400, 20);
+  }
+
+  if (state === "paused") {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+    ctx.fillRect(0, 0, W, H);
+    drawText("Paused", W / 2, 250, 44);
+    drawButton("Resume", W / 2 - 80, 285, 160, 50, togglePause);
+    drawButton("Restart", W / 2 - 80, 350, 160, 50, startGame, "#f0a030");
+  }
+
+  if (state === "gameover") {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
+    ctx.fillRect(0, 0, W, H);
+    const px = 60, py = 150, pw = 280, ph = 210;
+    ctx.fillStyle = "#ded895";
+    ctx.strokeStyle = "#543847";
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.roundRect(px, py, pw, ph, 14); ctx.fill(); ctx.stroke();
+    drawText("Game Over", W / 2, py - 18, 44, "#ff5a4d");
+    ctx.fillStyle = "#8a6b3d";
+    ctx.font = "bold 16px Arial, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("SCORE", W / 2, py + 38);
+    ctx.fillText("HIGH SCORE", W / 2, py + 112);
+    drawText(score, W / 2, py + 80, 40);
+    drawText(bestScore, W / 2, py + 154, 40);
+    if (newBest) drawText("NEW HIGH SCORE!", W / 2, py + 192, 18, "#ff5a4d");
+    drawButton("Restart", W / 2 - 80, 385, 160, 50, startGame);
+    drawButton("Menu", W / 2 - 60, 450, 120, 40, goMenu, "#6aa9e0");
+  }
+}
+
+// ---------- Main loop ----------
+function draw() {
+  ctx.save();
+  if (shake > 0.5) {
+    ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    shake *= 0.85;
+  } else shake = 0;
+  drawBackground();
+  pipes.forEach(drawPipe);
+  drawGround();
+  drawSlime();
+  drawBird();
+  ctx.restore();
+  drawUI();
+}
+
+// Fixed 60 updates per second, so the game runs the same speed on 60/120/144 Hz screens
+let lastTime = 0, acc = 0;
+function loop(now = 0) {
+  acc += Math.min(now - lastTime, 100);
+  lastTime = now;
+  while (acc >= 1000 / 60) { update(); acc -= 1000 / 60; }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+resetGame();
+state = "menu";
+loop();
+
+</script>
+</body>
+</html>
